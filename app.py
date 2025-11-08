@@ -1,10 +1,14 @@
 """
-Flask microservice exposing /predict and /retrain,
-auto-building the CSV if missing. Cloud Run friendly.
+Flask microservice exposing /health, /features, /predict, /retrain.
+- Trains a RandomForest on a CSV (auto-builds from DB if missing).
+- Cloud Run friendly (/tmp for writes, listens on $PORT).
+- Flexible CORS via env: ALLOW_ALL_CORS=1 or CORS_ORIGINS="https://foo,https://bar".
 """
 
 import os
+import logging
 from threading import Lock
+from typing import List
 
 import pandas as pd
 from flask import Flask, request, jsonify, send_file, render_template
@@ -13,37 +17,47 @@ from joblib import load, dump
 from sklearn.ensemble import RandomForestClassifier
 from dotenv import load_dotenv
 
+# Your dataset builder (must exist in the repo)
 from build_training_dataset import build_dataset
 
-# Load env from .env when present (handy for local dev)
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
 load_dotenv()
 
-# -----------------------------------------------------------------------------
-# Flask app + Cloud Run basics
-# -----------------------------------------------------------------------------
 app = Flask(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+app.logger.setLevel(logging.getLevelName(os.getenv("LOG_LEVEL", "INFO")))
 
-# Cloud Run has a read-only FS; only /tmp is writable at runtime.
+# Cloud Run writable dir
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "/tmp")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
+# Paths
 MODEL_PATH = os.path.join(STORAGE_DIR, "model.pkl")
 DATA_PATH = os.environ.get("DATA_PATH", os.path.join(STORAGE_DIR, "training_data.csv"))
 PDF_PATH = os.path.join(STORAGE_DIR, "decision_tree.pdf")  # optional, may not exist
 
-# Allow overriding RF size via env (default 100)
+# Model size
 N_ESTIMATORS = int(os.environ.get("N_ESTIMATORS", "100"))
 
-# CORS origins (comma-separated list)
-CORS_ORIGINS = [
-    o.strip()
-    for o in os.environ.get(
-        "CORS_ORIGINS",
-        "https://career-comm-main-laravel.onrender.com,https://ccsuggest.netlify.app,http://localhost:8000",
-    ).split(",")
-    if o.strip()
-]
-CORS(app, origins=CORS_ORIGINS)
+# Control whether we’re allowed to build the CSV from DB when missing
+ALLOW_DB_BUILD = os.environ.get("ALLOW_DB_BUILD", "1") == "1"
+
+# CORS configuration
+ALLOW_ALL_CORS = os.environ.get("ALLOW_ALL_CORS", "0") == "1"
+if ALLOW_ALL_CORS:
+    # Quick testing: allow any browser origin (no cookies needed for this API)
+    CORS(app, resources={r"/*": {"origins": "*"}})
+else:
+    CORS_ORIGINS = [
+        o.strip() for o in os.environ.get(
+            "CORS_ORIGINS",
+            # put your real frontend origin(s) here, comma-separated
+            "http://localhost:8000"
+        ).split(",") if o.strip()
+    ]
+    CORS(app, origins=CORS_ORIGINS)
 
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "http://127.0.0.1:8000")
 
@@ -52,68 +66,67 @@ REDIRECT_URL = os.environ.get("REDIRECT_URL", "http://127.0.0.1:8000")
 # -----------------------------------------------------------------------------
 def ensure_csv(csv_path: str = DATA_PATH):
     """
-    Make sure the CSV exists. If missing, build it from the database via
-    build_training_dataset.build_dataset().
+    Make sure the training CSV exists. If missing and allowed, build from DB.
     """
-    if not os.path.isfile(csv_path):
-        app.logger.info("Training data CSV not found, building from database...")
-        build_dataset(csv_path)
-        app.logger.info(f"Training data built successfully: {csv_path}")
+    if os.path.isfile(csv_path):
+        return
+    if not ALLOW_DB_BUILD:
+        raise FileNotFoundError(
+            f"{csv_path} does not exist and ALLOW_DB_BUILD=0. "
+            "Provide a CSV via DATA_PATH or enable ALLOW_DB_BUILD=1."
+        )
+    app.logger.info("Training data CSV not found, building from database...")
+    build_dataset(csv_path)
+    app.logger.info("Training data built successfully: %s", csv_path)
 
 
 def train_and_save() -> RandomForestClassifier:
     """
-    Train a RandomForest on the training CSV and save it to MODEL_PATH.
-    Returns the fitted classifier.
+    Train RandomForest on the CSV and persist the model to MODEL_PATH.
     """
-    try:
-        ensure_csv(DATA_PATH)
-        df = pd.read_csv(DATA_PATH)
+    ensure_csv(DATA_PATH)
+    df = pd.read_csv(DATA_PATH)
 
-        if df.empty:
-            raise ValueError("Training dataset is empty. No responses found in database.")
-        if len(df) < 10:
-            raise ValueError(f"Insufficient training data: only {len(df)} records found. Need at least 10.")
-        if "tech_field_id" not in df.columns:
-            raise ValueError("Missing 'tech_field_id' column in training data.")
+    if df.empty:
+        raise ValueError("Training dataset is empty. No responses found in database.")
+    if len(df) < 10:
+        raise ValueError(f"Insufficient training data: only {len(df)} rows. Need at least 10.")
+    if "tech_field_id" not in df.columns:
+        raise ValueError("Missing 'tech_field_id' column in training data.")
 
-        X = df.drop("tech_field_id", axis=1)
-        y = df["tech_field_id"]
+    X = df.drop(columns=["tech_field_id"])
+    y = df["tech_field_id"]
 
-        if X.empty or X.shape[1] == 0:
-            raise ValueError("No feature columns found in training data.")
+    if X.empty or X.shape[1] == 0:
+        raise ValueError("No feature columns found in training data.")
 
-        app.logger.info(f"Training RandomForest(n_estimators={N_ESTIMATORS}) "
-                        f"with {len(df)} rows and {X.shape[1]} features.")
-        clf = RandomForestClassifier(n_estimators=N_ESTIMATORS, random_state=42)
-        clf.fit(X, y)
-        dump(clf, MODEL_PATH)
-        app.logger.info(f"Model saved to {MODEL_PATH}")
-        return clf
-    except Exception as e:
-        app.logger.exception(f"Training failed: {e}")
-        raise
+    app.logger.info("Training RandomForest(n_estimators=%d) with %d rows, %d features",
+                    N_ESTIMATORS, len(df), X.shape[1])
+    clf = RandomForestClassifier(n_estimators=N_ESTIMATORS, random_state=42)
+    clf.fit(X, y)
+    dump(clf, MODEL_PATH)
+    app.logger.info("Model saved to %s", MODEL_PATH)
+    return clf
 
 
 def get_model() -> RandomForestClassifier:
     """
-    Load a saved model if present; otherwise train and save a new one.
+    Load an existing model or train a new one.
     """
     if os.path.exists(MODEL_PATH):
         return load(MODEL_PATH)
     return train_and_save()
 
 
-# Lazy model so container can start immediately (no blocking work at import).
+# Lazy model so startup is instant (no work at import)
 _clf = None
 _clf_lock = Lock()
-
 
 def _lazy_model() -> RandomForestClassifier:
     global _clf
     if _clf is None:
         with _clf_lock:
-            if _clf is None:  # double-checked locking
+            if _clf is None:
                 _clf = get_model()
     return _clf
 
@@ -124,14 +137,17 @@ def _lazy_model() -> RandomForestClassifier:
 @app.get("/")
 def index():
     """
-    Simple root. If templates/index.html exists, render it;
-    otherwise return a JSON OK so the root never 500s.
+    If templates/index.html exists, render it; otherwise return JSON.
     """
     templates_dir = os.path.join(app.root_path, "templates")
     index_tpl = os.path.join(templates_dir, "index.html")
     if os.path.exists(index_tpl):
         return render_template("index.html", redirect_url=REDIRECT_URL)
-    return jsonify({"status": "ok", "redirect_url": REDIRECT_URL})
+    return jsonify({
+        "status": "ok",
+        "service": "career-comm-ml",
+        "redirect_url": REDIRECT_URL
+    })
 
 
 @app.get("/health")
@@ -142,8 +158,8 @@ def health():
 @app.get("/export_tree")
 def export_tree():
     """
-    Optional: returns a previously generated decision_tree.pdf if present.
-    (This app trains a RandomForest; PDF export is not generated here.)
+    Return a previously generated PDF (optional).
+    Note: This app trains a RandomForest; it does not generate a PDF by itself.
     """
     if os.path.exists(PDF_PATH):
         return send_file(PDF_PATH, as_attachment=True)
@@ -153,12 +169,14 @@ def export_tree():
 @app.get("/features")
 def features():
     """
-    Expose feature column names expected by the model (helps your frontend).
+    Expose the required feature order for building request vectors client-side.
     """
     try:
         model = _lazy_model()
-        return jsonify({"features": model.feature_names_in_.tolist()})
+        feats: List[str] = model.feature_names_in_.tolist()  # type: ignore[attr-defined]
+        return jsonify({"features": feats})
     except Exception as e:
+        app.logger.exception("/features failed: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -173,29 +191,34 @@ def predict():
 
     try:
         model = _lazy_model()
-        expected = len(model.feature_names_in_)
+        expected = len(model.feature_names_in_)  # type: ignore[attr-defined]
+
+        if not isinstance(feats, list):
+            return jsonify({"status": "error", "error": "Payload must include a 'features' array."}), 400
 
         if len(feats) != expected:
             return jsonify({
                 "status": "error",
-                "error": f"Expected {expected} features in this order: {model.feature_names_in_.tolist()}",
+                "error": f"Expected {expected} features in this order: {model.feature_names_in_.tolist()}",  # type: ignore[attr-defined]
             }), 400
 
-        df_feats = pd.DataFrame([feats], columns=model.feature_names_in_)
+        df_feats = pd.DataFrame([feats], columns=model.feature_names_in_)  # type: ignore[attr-defined]
         probs = model.predict_proba(df_feats)[0]
         labels = model.classes_.tolist()
-        # Ensure JSON-serializable keys
+
+        # JSON-safe: cast keys/values
         response = {int(k): float(v) for k, v in zip(labels, probs.tolist())}
         return jsonify(response)
+
     except Exception as e:
-        app.logger.exception(f"/predict failed: {e}")
+        app.logger.exception("/predict failed: %s", e)
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.post("/retrain")
 def retrain():
     """
-    Rebuild (if needed) and retrain the model, then reload it in-memory.
+    Rebuild (if needed) and retrain the model, then load it into memory.
     """
     try:
         global _clf
@@ -212,7 +235,7 @@ def retrain():
             "suggestion": "Ensure you have completed questionnaires in the database before retraining."
         }), 400
     except Exception as e:
-        app.logger.exception(f"/retrain failed: {e}")
+        app.logger.exception("/retrain failed: %s", e)
         return jsonify({"status": "error", "error": f"Unexpected error during retraining: {e}"}), 500
 
 
