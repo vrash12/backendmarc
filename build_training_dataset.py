@@ -16,7 +16,7 @@ DB_DEFAULTS = {
     "DB_PORT": 3306,
     "DB_NAME": "u782952718_marcky",
     "DB_USER": "u782952718_marcky",        # change if your DB user differs
-    "DB_PASS": "2QcU3waQi$",                          # set in Cloud Run/Secret Manager
+    "DB_PASS": "Allenturing123.",                          # set in Cloud Run/Secret Manager
     "DB_SSL_DISABLED": "true",              # Hostinger commonly OK with this
 }
 
